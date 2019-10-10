@@ -26,9 +26,12 @@ namespace Microsoft.Azure.ContainerRegistry
         /// </summary>
         public enum LoginMode
         {
-            Basic, // Basic authentication
-            TokenAuth, // Authentication using oauth2 with login and password
-            TokenAad // Authentication using an AAD access token.
+            /// <summary> Basic authentication </summary>
+            Basic,
+            /// <summary> Authentication using oauth2 with login and password </summary>
+            TokenAuth,
+            /// <summary> Authentication using an AAD access token.</summary>
+            TokenAad
         }
 
         #endregion
@@ -53,13 +56,21 @@ namespace Microsoft.Azure.ContainerRegistry
         private AuthToken _aadAccess;
 
         #endregion
+        
+        // initialization logic helper.
+        private void Initialize()
+        {
+            if (_mode == LoginMode.Basic) // Basic Authentication
+            {
+                _authHeader = Helpers.EncodeTo64($"{_username}:{_password}");
+            }
+        }
 
         #region Constructors
 
         /// <summary>
-        /// Constructor for use when providing user credentials. Users may specify if basic authorization is to be used or if more secure JWT token reliant
-        /// authorization will be used.
-        /// @Throws If LoginMode is set to TokenAad
+        /// Construct an AcrClientCredentials object from user credentials. Users may specify basic authentication or the more secure oauth2 (token) based authentication.
+        /// <exception cref="Exception"> Throws an exception if LoginMode is set to TokenAad </exception>
         /// <paramref name="mode"/> The credential acquisition mode, one of Basic, TokenAuth, or TokenAad
         /// <paramref name="loginUrl"/> The url of the registry to be used
         /// <paramref name="username"/> The username for the registry
@@ -67,59 +78,41 @@ namespace Microsoft.Azure.ContainerRegistry
         /// </summary>
         public AcrClientCredentials(LoginMode mode, string loginUrl, string username, string password, CancellationToken cancellationToken = default)
         {
+            if (mode == LoginMode.TokenAad)
+            {
+                throw new ArgumentException("This constructor does not permit AAD Authentication. Please use an appropriate constructor.");
+            }
+
             _acrScopes = new Dictionary<string, string>();
             _acrAccessTokens = new Dictionary<string, AcrAccessToken>();
             _mode = mode;
-            if (_mode == LoginMode.TokenAad)
-            {
-                throw new Exception("AAD token authorization requires you to provide the AAD_access_token");
-            }
-            // Proofing in case passed in loginurl includes https start.
-            if (loginUrl.StartsWith("https://"))
-            {
-                loginUrl.Substring("https://".Length);
-            }
-            if (loginUrl.EndsWith("/"))
-            {
-                loginUrl.Substring(0, loginUrl.Length - 1);
-            }
-
-            _loginUrl = loginUrl;
+            _loginUrl = ProcessLoginUrl(loginUrl);
             _username = username;
             _password = password;
             _requestCancellationToken = cancellationToken;
+
+            Initialize();
         }
 
         /// <summary>
-        /// Constructor for use when providing an aad access token to be exchanged for an acr refresh token. Note that token expiration will require manually
-        /// providing new aad tokens.This model assumes the client is able to do this authentication themselves for AAD tokens. A callback can be provided to
-        /// be executed once the ACR refresh token expires and can no longer be renewed as the provided Aad Token has expired.
+        /// Construct an AcrClientCredentials object from an AAD Token. A callback can be provided to renew the AAD token when it expires.
         /// <paramref name="aadAccessToken"/> The password for the registry
         /// <paramref name="loginUrl"/> The Azure active directory access token to be used
         /// <paramref name="tenant"/> The tenant of the aad access token (optional)
-        /// <paramref name="acquireNewAad"/> A function that can be called to refresh an aadAccessToken, providing a new one (optional) note, if this is not
-        /// provided the aad access token will expire over time and calls wll cease to work.
+        /// <paramref name="acquireNewAad"/> Callback function to refresh the <paramref name="aadAccessToken">. Without this parameter, the AAD token cannot be refreshed.
         /// </summary>
-        public AcrClientCredentials(string aadAccessToken, string loginUrl, string tenant = null,  AuthToken.acquireCallback acquireNewAad = null, CancellationToken cancellationToken = default)
+        public AcrClientCredentials(string aadAccessToken, string loginUrl, string tenant = null, AuthToken.AcquireCallback acquireNewAad = null, CancellationToken cancellationToken = default)
         {
             _acrScopes = new Dictionary<string, string>();
             _acrAccessTokens = new Dictionary<string, AcrAccessToken>();
             _mode = LoginMode.TokenAad;
-
-            // Proofing in case passed in loginurl includes https start.
-            if (loginUrl.StartsWith("https://"))
-            {
-                loginUrl.Substring("https://".Length);
-            }
-            if (loginUrl.EndsWith("/"))
-            {
-                loginUrl.Substring(0, loginUrl.Length - 1);
-            }
-            _loginUrl = loginUrl;
+            _loginUrl = ProcessLoginUrl(loginUrl);
             _requestCancellationToken = cancellationToken;
             _aadAccess = new AuthToken(aadAccessToken, acquireNewAad);
             _acrRefresh = new AcrRefreshToken(_aadAccess, _loginUrl);
             _tenant = tenant;
+
+            Initialize();
         }
 
         #endregion
@@ -129,22 +122,36 @@ namespace Microsoft.Azure.ContainerRegistry
         /// <summary>
         /// Called on initialization of the credentials. This sets forth the type of authorization to be used if necessary.
         /// </summary>
-        public override void InitializeServiceClient<AzureContainerRegistryClient>(ServiceClient<AzureContainerRegistryClient> client)
+        public override void InitializeServiceClient<T>(ServiceClient<T> client)
         {
-            if (_mode == LoginMode.Basic) // Basic Authentication
+            if (client == null)
             {
-                _authHeader = EncodeTo64(_username + ":" + _password);
+                throw new ArgumentNullException(nameof(client));
             }
+
+            // if this is an ACRClient, add the loginUri that this credential was created for
+            if (client is AzureContainerRegistryClient acrClient)
+            {
+                if (acrClient.LoginUri == null)
+                {
+                    acrClient.LoginUri = this._loginUrl;
+                }
+                // if the login uris don't match
+                else if (!acrClient.LoginUri.ToLower().Contains(this._loginUrl.ToLower()))
+                {
+                    throw new ValidationException($"\"{nameof(AzureContainerRegistryClient)}'s\" LoginUrl does not match \"{nameof(AcrClientCredentials)} LoginUrl");
+                }
+            } 
         }
 
         /// <summary>
-        /// Handles all requests of the SDK providing the required authentication along the way.
+        /// Apply the credentials to the HTTP request.
         /// </summary>
         public override async Task ProcessHttpRequestAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             if (request == null)
             {
-                throw new ArgumentNullException("request");
+                throw new ArgumentNullException(nameof(request));
             }
 
             if (_mode == LoginMode.Basic)
@@ -153,40 +160,55 @@ namespace Microsoft.Azure.ContainerRegistry
             }
             else
             {
-                string operation = "https://" + _loginUrl + request.RequestUri.AbsolutePath;
-                string scope = await getScope(operation, request.Method.Method, request.RequestUri.AbsolutePath);
+                string operation = $"https://{_loginUrl}{request.RequestUri.AbsolutePath}";
+                string scope = await GetScope(operation, request.Method.Method, request.RequestUri.AbsolutePath);
 
-                request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + getAcrAccessToken(scope));
+                request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {GetAcrAccessToken(scope)}");
             }
-            await base.ProcessHttpRequestAsync(request, cancellationToken);
 
+            await base.ProcessHttpRequestAsync(request, cancellationToken);
         }
 
         #endregion
 
         #region Helpers
 
+        private static string ProcessLoginUrl(string loginUrl)
+        {
+            // Proofing in case passed in loginurl includes https start.
+            if (loginUrl.ToLower().StartsWith("https://"))
+            {
+                loginUrl.Substring("https://".Length);
+            }
+            if (loginUrl.EndsWith("/"))
+            {
+                loginUrl.Substring(0, loginUrl.Length - 1);
+            }
+
+            return loginUrl;
+        }
+
         /// <summary>
         /// Acquires a new ACR access token if necessary. It can also acquire a cached access token in order to avoid extra requests to
         /// the oauth2 endpoint improving efficiency.
         /// <param name='scope'> The scope for the particuar operation. Can be obtained from the Www-Authenticate header.
         /// </summary>
-        public string getAcrAccessToken(string scope)
+        private string GetAcrAccessToken(string scope)
         {
             if (_mode == LoginMode.Basic)
             {
                 throw new Exception("This Function cannot be invoked for requested Login Mode. Basic Authentication does not support JWT Tokens ");
             }
 
-            // If Token is available or existed and can be renewed
-            if (_acrAccessTokens.ContainsKey(scope))
+            // if token is stale, hit refresh
+            if (_acrAccessTokens.TryGetValue(scope, out AcrAccessToken token))
             {
-                if (!_acrAccessTokens[scope].CheckAndRefresh())
+                if (!token.CheckAndRefresh())
                 {
-                    throw new Exception("Access Token for scope " + scope + " expired and could not be refreshed");
+                    throw new Exception($"Access Token for scope {scope} expired and could not be refreshed");
                 }
 
-                return _acrAccessTokens[scope].Value;
+                return token.Value;
             }
 
             if (_mode == LoginMode.TokenAad)
@@ -204,16 +226,17 @@ namespace Microsoft.Azure.ContainerRegistry
         /// <summary>
         /// Acquires the required scope for a specific operation. This will be done by obtaining a challenge and parsing out the scope
         /// from the ww-Authenticate header. In the event of failure (Some endpoints do not seem to return the scope) it will attempt
-        /// resolution through a small local resolver.
+        /// resolution through a local resolver <see cref="ResolveScopeLocally">.
         /// <param name='scope'> The scope for the particuar operation. Can be obtained from the Www-Authenticate header.
         /// </summary>
 
-        public async Task<string> getScope(string operation, string method, string path)
+        private async Task<string> GetScope(string operation, string method, string path)
         {
+            string methodOperationKey = $"{method}>{operation}";
 
-            if (_acrScopes.ContainsKey(method + ">" + operation))
+            if (_acrScopes.TryGetValue(methodOperationKey, out string result))
             {
-                return _acrScopes[method + ">" + operation];
+                return result;
             }
 
             HttpClient runtimeClient = new HttpClient();
@@ -222,13 +245,12 @@ namespace Microsoft.Azure.ContainerRegistry
             try
             {
                 response = await runtimeClient.SendAsync(new HttpRequestMessage(new HttpMethod(method), operation));
-                Dictionary<string, string> data = parseHeader(response.Headers.GetValues("Www-Authenticate").FirstOrDefault());
-                scope = data.ContainsKey("scope") ? data["scope"] : hardcodedScopes(path);
-                _acrScopes[method + ">" + operation] = scope;
+                scope = GetScopeFromHeaders(response.Headers)?? ResolveScopeLocally(path);
+                _acrScopes[methodOperationKey] = scope;
             }
             catch (Exception e)
             {
-                throw new Exception("Could not identify appropriate Token scope: " + e.Message);
+                throw new Exception($"Could not identify appropriate Token scope: {e.Message}");
             }
             return scope;
 
@@ -238,45 +260,61 @@ namespace Microsoft.Azure.ContainerRegistry
         /// Local resolver for endpoints that will often return no scope.
         /// <param name='operation'> Operation for which a scope is necessary
         /// </summary>
-        private string hardcodedScopes(string operation)
+        private string ResolveScopeLocally(string operation)
         {
+            const string v1Operation = "/acr/v1/_catalog";
+            const string v2Operation = "/v2/";
             switch (operation)
             {
-                case "/acr/v1/_catalog":
-                case "/v2/":
+                case v1Operation:
+                case v2Operation:
                     return "registry:catalog:*";
                 default:
                     throw new Exception("Could not determine appropriate scope for the specified operation");
-
             }
         }
 
         /// <summary>
-        /// Meant to parse out comma separated key value pairs delineated by the = sign. Accepts strings of the
-        /// format "key=value,key2=value2..." . Note this method is meant to provide limited functionality and
-        /// is not very robust.
-        ///  </summary>
-        private Dictionary<string, string> parseHeader(string header)
+        /// Parse value of scope key from the 'Www-Authenticate' challenge header. See RFC 7235 section 4.1 for more info on the 
+        /// Ex challenge header value: 
+        ///  Bearer realm="https://test.azurecr.io/oauth2/token",service="test.azurecr.io",scope="repository:hello-txt:metadata_read"
+        /// Return null if it is not present
+        /// </summary>
+        private string GetScopeFromHeaders(HttpHeaders headers)
         {
+            string challengeHeader = "Www-Authenticate".ToLower();
+            string headerValue = "";
 
-            Dictionary<string, string> parsed = new Dictionary<string, string>();
-
-            Regex re = new Regex(@"([\w\s]+)=""[^""]+"""); //Regex is required to allow multiple scopes like push,pull
-            MatchCollection parts = re.Matches(header);
-
-            foreach (Match part in parts)
+            foreach (var headerKVP in headers)
             {
-                string[] keyValues = part.ToString().Split('=');
-                parsed.Add(keyValues[0], headerTrim(keyValues[1]));
+                if (headerKVP.Key.ToLower() == challengeHeader)
+                {
+                    headerValue = string.Join(",", headerKVP.Value);
+                    break;
+                }
+            }
+            
+            foreach (string part in headerValue.Split(','))
+            {
+                string[] keyValues = part.Split(new char[] { '=' }, 2);
+                if (keyValues.Length != 2)
+                {
+                    throw new Exception($"{challengeHeader} has incorrect format, " +
+                        $"header key-value pair '{part}' does not have a value but in '{headerValue}'");
+                }
+                if (keyValues[0].ToLower().Trim() == "scope")
+                {
+                    return TrimDoubleQuotes(keyValues[1]);
+                } 
             }
 
-            return parsed;
+            return null;
         }
 
         /// <summary>
         /// Removes trailing whitespace or " characters.
         /// </summary>
-        private string headerTrim(string toTrim)
+        private string TrimDoubleQuotes(string toTrim)
         {
             toTrim = toTrim.Trim();
             if (toTrim.StartsWith("\"")) toTrim = toTrim.Substring(1);
@@ -287,17 +325,10 @@ namespace Microsoft.Azure.ContainerRegistry
         /// <summary>
         /// Provides cleanup in case Cache is getting large. 
         ///</summary>
-        public void clearCache()
+        private void ClearCache()
         {
             _acrAccessTokens.Clear();
             _acrScopes.Clear();
-        }
-
-        static public string EncodeTo64(string toEncode)
-        {
-            byte[] toEncodeAsBytes = System.Text.ASCIIEncoding.ASCII.GetBytes(toEncode);
-            string returnValue = System.Convert.ToBase64String(toEncodeAsBytes);
-            return returnValue;
         }
 
         #endregion
